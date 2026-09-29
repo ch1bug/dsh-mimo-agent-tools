@@ -1,9 +1,13 @@
 {
   "name": "dsh-mimo-agent-tools",
-  "version": "0.1.0",
-  "description": "Xiaomi MiMo search + multimodal tools for DSH agents: mimo_search/vision/audio/video/asr/tts.",
+  "version": "0.2.0",
+  "description": "Xiaomi MiMo (V2.6 pro/flash) search + multimodal tools for DSH agents: mimo_search/think/json/vision/audio/video/asr/tts/voiceclone.",
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.js",
     "cordis.patch.yml",

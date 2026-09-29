@@ -30,7 +30,7 @@ class BuildBodyTest(unittest.TestCase):
         return p
 
     def spec(self, **overrides):
-        base = {"model": "mimo-v2.5", "key": "k", "url": "https://api.xiaomimimo.com/v1/chat/completions"}
+        base = {"model": "mimo-v2.6-flash", "key": "k", "url": "https://api.xiaomimimo.com/v1/chat/completions"}
         base.update(overrides)
         return base
 
@@ -99,13 +99,19 @@ class BuildBodyTest(unittest.TestCase):
         self.assertEqual(c[1]["image_url"]["url"], "https://e.com/i.jpg")
 
     def test_video_url_with_fps_and_resolution(self):
-        body = mimo_driver.build_body(self.spec(kind="video", urls=["https://e.com/v.mp4"], fps=2, media_resolution="default", prompt="desc"))
+        body = mimo_driver.build_body(self.spec(kind="video", urls=["https://e.com/v.mp4"], fps=2, media_resolution="max", prompt="desc"))
         c = body["messages"][0]["content"]
         self.assertEqual(c[0]["type"], "video_url")
         self.assertEqual(c[0]["video_url"]["url"], "https://e.com/v.mp4")
-        self.assertEqual(c[0]["fps"], 2)
-        self.assertEqual(c[0]["media_resolution"], "default")
+        self.assertEqual(c[0]["fps"], 2.0)
+        self.assertEqual(c[0]["media_resolution"], "max")
         self.assertEqual(c[1]["type"], "text")
+
+    def test_video_fractional_fps(self):
+        """The API fps is a float in [0.1, 10.0] — a fractional value must survive."""
+        body = mimo_driver.build_body(self.spec(kind="video", urls=["https://e.com/v.mp4"], fps=0.5, prompt="desc"))
+        c = body["messages"][0]["content"]
+        self.assertEqual(c[0]["fps"], 0.5)
 
     def test_video_local_file_is_data_url(self):
         body = mimo_driver.build_body(self.spec(kind="video", files=[{"kind": "video", "mime": "video/mp4", "path": self.touch("v.mp4")}]))
@@ -117,20 +123,23 @@ class BuildBodyTest(unittest.TestCase):
     def test_think_enables_thinking(self):
         body = mimo_driver.build_body(self.spec(kind="think", prompt="hard problem"))
         self.assertEqual(body["thinking"], {"type": "enabled"})
-        self.assertEqual(body["max_completion_tokens"], 4096)
+        # max_completion_tokens covers reasoning tokens too (API range [1, 131072]).
+        self.assertEqual(body["max_completion_tokens"], 16384)
         self.assertNotIn("response_format", body)
 
     def test_json_uses_response_format(self):
         body = mimo_driver.build_body(self.spec(kind="json", prompt="give me json"))
         self.assertEqual(body["response_format"], {"type": "json_object"})
-        self.assertEqual(body["max_completion_tokens"], 4096)
+        self.assertEqual(body["max_completion_tokens"], 8192)
         self.assertEqual(body["messages"][0]["role"], "system")
         self.assertIn("JSON", body["messages"][0]["content"])
         self.assertEqual(body["messages"][1]["role"], "user")
 
     def test_default_chat_has_thinking_disabled(self):
+        """MiMo-V2.6 enables thinking by default — plain calls must disable it."""
         body = mimo_driver.build_body(self.spec(kind="chat", prompt="hi"))
         self.assertEqual(body["thinking"], {"type": "disabled"})
+        self.assertEqual(body["model"], "mimo-v2.6-flash")
         self.assertNotIn("response_format", body)
 
 

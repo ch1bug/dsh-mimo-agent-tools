@@ -1,13 +1,29 @@
 // dsh-mimo-agent-tools — Xiaomi MiMo search + multimodal tools.
 // Installed as a DSH bundle (`dsh plugin --profile <name> add .`).
-// Registers mimo_search / mimo_vision / mimo_audio / mimo_video / mimo_asr /
-// mimo_tts as model tools.
+// Registers mimo_search / mimo_think / mimo_json / mimo_vision / mimo_audio /
+// mimo_video / mimo_asr / mimo_tts / mimo_voiceclone as model tools.
+//
+// Models: the MiMo-V2.6 generation (mimo-v2.6-pro / mimo-v2.6-flash /
+// mimo-v2.6-pro-ultraspeed) for web search, deep thinking, structured output
+// and full-modal media understanding — in V2.6 every tier is omni-modal, so
+// the old v2.5 split (mimo-v2.5-pro for text, mimo-v2.5 for media) collapses
+// into one model id. Speech stays on the v2.5 voice models (mimo-v2.5-asr,
+// mimo-v2.5-tts, -voicedesign, -voiceclone): Xiaomi ships no v2.6 voice
+// models. mimo-v2.5 / mimo-v2.5-pro are deprecated (2026-10-21) and are no
+// longer referenced anywhere.
 //
 // The API key is resolved from the DSH credentials service (key
 // XIAOMI_API_KEY, written by the web Models page). The python driver path is
 // shell-expanded (${MIMO_DRIVER:-$HOME/.local/lib/...}) because the plugin
 // sandbox has no process.env. Large base64 payloads are handled entirely
-// inside the python driver to dodge the 64KB shell stdout cap.
+// inside the python driver to dodge the 64KB shell stdout capture; only the
+// small JSON reads raise `stdoutMaxBytes`.
+//
+// DSH 0.2.x seams used here: `shell.execute(shell.resolve(req)).result()`
+// (there is no `shell.run`), `sandboxPolicy.resolve({ session })`,
+// `credentials.resolve(ref)`, `skills.register(...)`, and `defineTool` from
+// `@deepseek-ai/dsh-tools`. Tool failures THROW — the registry turns a thrown
+// error into the model-facing isError result.
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'dsh-mimo-agent-tools'
@@ -18,7 +34,31 @@ export function apply(ctx) {
   const DRIVER_SPEC = '${MIMO_DRIVER:-$HOME/.local/lib/mimo-agent-tools/driver/mimo_driver.py}'
   const TMP_ROOT = '/tmp'
   const KEY_REF = 'XIAOMI_API_KEY'
+  // Trusted-read capture budget for the JSON files this plugin parses in full
+  // (API responses carry reasoning_content / citations and can exceed the
+  // default 64KB capture). Media payloads still never cross stdout.
+  const MAX_READ_BYTES = 8 * 1024 * 1024
   const PRESET_VOICES = new Set(['mimo_default', '冰糖', '茉莉', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dean'])
+
+  // MiMo-V2.6 tiers. Every one of them accepts text, image, audio and video
+  // input (full-modal), so a `model` parameter is just a price/quality dial.
+  const MODELS = {
+    pro: 'mimo-v2.6-pro',
+    flash: 'mimo-v2.6-flash',
+    ultraspeed: 'mimo-v2.6-pro-ultraspeed',
+  }
+  /** Resolve a caller's tier alias ("pro"/"flash"/"ultraspeed") or pass a full model id through. */
+  function resolveModel(value, fallback) {
+    const raw = String(value ?? fallback).trim()
+    return MODELS[raw.toLowerCase()] ?? raw
+  }
+  /** The shared `model` parameter, naming the per-tool default tier. */
+  function modelParam(defaultTier) {
+    return {
+      type: 'string',
+      description: `MiMo-V2.6 tier: "pro", "flash" (cheap full-modal), "ultraspeed" (~20x output speed, 10x price), or a full model id (default ${defaultTier}).`,
+    }
+  }
 
   // UTF-8-safe base64: Node's b64() rejects non-Latin-1 (Chinese TTS text
   // would throw "Invalid character"). Encode via TextEncoder + bytes first.
@@ -47,6 +87,17 @@ export function apply(ctx) {
     for (const [ext, mime] of Object.entries(map)) if (p.endsWith(ext)) return mime
     return 'application/octet-stream'
   }
+  /** Clamp a caller-supplied integer into the API's documented range. */
+  function clampInt(value, min, max, fallback) {
+    const n = Number(value)
+    if (!Number.isFinite(n)) return fallback
+    return Math.min(max, Math.max(min, Math.round(n)))
+  }
+
+  // One shell command through the DSH shell seam. The current seam shape is
+  // `execute(spec).result()` (there is no `shell.run`); a preparation/spawn
+  // failure REJECTS, so fold it back into the same result shape callers branch
+  // on instead of leaking a second error path.
   async function run(command, exec, opts = {}) {
     const sandboxPolicy = ctx.get('sandboxPolicy')
     const policy = sandboxPolicy === undefined ? undefined : sandboxPolicy.resolve(
@@ -56,10 +107,24 @@ export function apply(ctx) {
     const request = {
       command,
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      ...(opts.stdoutMaxBytes !== undefined ? { stdoutMaxBytes: opts.stdoutMaxBytes } : {}),
       ...(policy !== undefined ? { sandboxPolicy: policy } : {}),
       ...(exec !== undefined && exec.signal !== undefined ? { signal: exec.signal } : {})
     }
-    return shell.run(shell.resolve(request))
+    try {
+      const execution = await shell.execute(shell.resolve(request))
+      return await execution.result()
+    } catch (error) {
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        aborted: exec !== undefined && exec.signal !== undefined && exec.signal.aborted === true,
+        timeoutMs: opts.timeoutMs ?? 0,
+        stdout: { text: '', truncated: false },
+        stderr: { text: String(error instanceof Error ? error.message : error), truncated: false },
+      }
+    }
   }
 
   async function resolveKey() {
@@ -73,6 +138,10 @@ export function apply(ctx) {
     throw new Error(`${KEY_REF} is not configured — store it in the DSH credentials service (web Models page)`)
   }
 
+  // Drive the python relay: spec/response files on disk, so multi-megabyte
+  // base64 never crosses the shell's stdout capture. Returns the parsed API
+  // response and THROWS a plain Error on every failure — the tool registry
+  // materializes a thrown error as the model-facing isError result.
   async function runDriver(spec, exec, timeoutMs = 120000) {
     const key = await resolveKey()
     const full = { url: BASE_URL + '/chat/completions', key, timeout: timeoutMs / 1000 | 0, ...spec }
@@ -83,29 +152,34 @@ export function apply(ctx) {
     const r = await run(cmd, exec, { timeoutMs: timeoutMs + 20000 })
     const status = r.stdout.text.trim()
     let respText = null
-    try { respText = (await run(`cat ${shq(respFile)}`, exec, { timeoutMs: 10000 })).stdout.text } catch {}
+    try {
+      respText = (await run(`cat ${shq(respFile)}`, exec, { timeoutMs: 10000, stdoutMaxBytes: MAX_READ_BYTES })).stdout.text
+    } catch {}
     await run(`rm -f ${shq(specFile)} ${shq(respFile)}`, exec, { timeoutMs: 5000 }).catch(() => {})
     if (status === 'OK') {
-      try {
-        const data = JSON.parse(respText.trim())
-        // Normalize API-level errors (d.error) once here so every tool's
-        // execute is just `if (!res.ok) return res`.
-        if (data?.error !== undefined) {
-          return { ok: false, error: typeof data.error === 'string' ? data.error : data.error.message ?? 'API error' }
-        }
-        return { ok: true, data }
-      } catch { return { ok: false, error: 'unparseable API response' } }
+      let data = null
+      try { data = JSON.parse((respText || '').trim()) } catch { throw new Error('unparseable API response') }
+      // Normalize API-level errors (d.error) once here so every tool's
+      // execute is just `const d = await runDriver(...)`.
+      if (data?.error !== undefined) {
+        throw new Error(typeof data.error === 'string' ? data.error : data.error.message ?? 'API error')
+      }
+      return data
     }
     const t = (respText || '').trim()
+    let message
     if (t.startsWith('HTTP_ERR:')) {
       const rest = t.slice(9)
       try {
         const e = JSON.parse(rest).error
-        return { ok: false, error: (typeof e.message === 'string' ? e.message : '') + (e.param ? ` (${e.param})` : '') }
-      } catch { return { ok: false, error: rest.slice(0, 400) } }
+        message = (typeof e.message === 'string' ? e.message : '') + (e.param ? ` (${e.param})` : '')
+      } catch { message = rest.slice(0, 400) }
+    } else if (t.startsWith('NET_ERR:')) {
+      message = t.slice(8)
+    } else {
+      message = (t || status || 'no response').slice(0, 400)
     }
-    if (t.startsWith('NET_ERR:')) return { ok: false, error: t.slice(8) }
-    return { ok: false, error: (t || 'no response').slice(0, 400) }
+    throw new Error(message)
   }
 
   const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
@@ -122,38 +196,44 @@ export function apply(ctx) {
   const tools = [
     {
       name: 'mimo_search',
-      description: 'Search the web through the Xiaomi MiMo native web_search tool (mimo-v2.5-pro). Returns a model-written answer plus cited sources (url/title/snippet/publishedAt). Use for current events, news, prices, facts, and any query needing fresh web information.',
+      description: 'Search the web through the Xiaomi MiMo native web_search tool (MiMo-V2.6). Returns a model-written answer plus cited sources (url/title/snippet/publishedAt/site_name/logo_url). Use for current events, news, prices, facts, and any query needing fresh web information.',
       parameters: {
         query: { type: 'string', required: true, description: 'The search query' },
-        max_keyword: { type: 'integer', description: 'Max keywords per search round (default 3, cost control)' },
-        limit: { type: 'integer', description: 'Max citations returned (default 5)' },
-        force_search: { type: 'boolean', description: 'Force a fresh web search instead of allowing cached results (default true)' },
+        model: modelParam('pro'),
+        max_keyword: { type: 'integer', description: 'Max keywords per search round, 1-50 (default 3, cost control)' },
+        limit: { type: 'integer', description: 'Max citations returned, 1-50 (default 5)' },
+        force_search: { type: 'boolean', description: 'Force a fresh web search instead of letting the model decide (default true)' },
         user_location: { type: 'object', additionalProperties: true, description: 'Approximate user location to bias results, e.g. {"type":"approximate","country":"China","region":"Hubei","city":"Wuhan"}' }
       },
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
         const key = await resolveKey()
-        const maxKeyword = args.max_keyword !== undefined ? args.max_keyword : 3
-        const limit = args.limit !== undefined ? args.limit : 5
-        const tool = { type: 'web_search', max_keyword: maxKeyword, force_search: args.force_search !== undefined ? args.force_search : true, limit }
+        const tool = {
+          type: 'web_search',
+          max_keyword: clampInt(args.max_keyword, 1, 50, 3),
+          force_search: args.force_search !== undefined ? args.force_search : true,
+          limit: clampInt(args.limit, 1, 50, 5),
+        }
         if (args.user_location !== undefined && args.user_location !== null) tool.user_location = args.user_location
         const body = {
-          model: 'mimo-v2.5-pro',
+          model: resolveModel(args.model, 'pro'),
           messages: [{ role: 'user', content: `Perform a web search for the query: ${args.query}` }],
           max_completion_tokens: 1024,
           stream: false,
+          // Thinking defaults to ENABLED since V2.6 — a search answer must not
+          // silently spend its completion budget on reasoning tokens.
           thinking: { type: 'disabled' },
           tools: [tool]
         }
         const json = JSON.stringify(body)
         const cmd = `curl -s --max-time 60 --location '${BASE_URL}/chat/completions' -H 'api-key: ${key}' -H 'Content-Type: application/json' -d ${shq(json)}`
-        const r = await run(cmd, exec, { timeoutMs: 70000 })
+        const r = await run(cmd, exec, { timeoutMs: 70000, stdoutMaxBytes: MAX_READ_BYTES })
         let data = null
         let parseError = null
         const out = r.stdout.text.trim()
         if (out) { try { data = JSON.parse(out) } catch { parseError = out.slice(0, 400) } }
-        if (data === null) return { ok: false, error: parseError || 'no response', stderr: r.stderr.text.trim().slice(0, 400) }
-        if (data.error !== undefined) return { ok: false, error: typeof data.error === 'string' ? data.error : data.error.message }
+        if (data === null) throw new Error(`${parseError || 'no response'}${r.stderr.text.trim() ? ` — ${r.stderr.text.trim().slice(0, 200)}` : ''}`)
+        if (data.error !== undefined) throw new Error(typeof data.error === 'string' ? data.error : data.error.message)
         const msg = data.choices?.[0]?.message
         const content = typeof msg?.content === 'string' && msg.content.length > 0 ? msg.content : null
         const seen = new Set()
@@ -171,24 +251,28 @@ export function apply(ctx) {
             ...(typeof ann.logo_url === 'string' && ann.logo_url.length > 0 ? { logo_url: ann.logo_url } : {})
           })
         }
-        return { ok: true, query: args.query, answer: content, sources, usage: data.usage ?? null }
+        return {
+          query: args.query,
+          answer: content,
+          // V2.6 reports a failed web-search round here instead of erroring out.
+          ...(typeof msg?.error_message === 'string' && msg.error_message.length > 0 ? { search_error: msg.error_message } : {}),
+          sources,
+          usage: data.usage ?? null
+        }
       }
     },
     {
       name: 'mimo_think',
-      description: 'Deep reasoning with the Xiaomi MiMo deep-thinking mode (mimo-v2.5-pro). The model works through the problem step by step before answering; the response carries both the full reasoning chain (reasoning_content) and the final answer. Use for complex reasoning, code generation, math, multi-step analysis, and any task where a plain answer risks missing a step.',
+      description: 'Deep reasoning with the Xiaomi MiMo deep-thinking mode (MiMo-V2.6). The model works through the problem step by step before answering; the response carries both the full reasoning chain (reasoning_content) and the final answer. Use for complex reasoning, code generation, math, multi-step analysis, and any task where a plain answer risks missing a step.',
       parameters: {
         prompt: { type: 'string', required: true, description: 'The question or problem to reason about' },
-        model: { type: 'string', description: 'Model (default mimo-v2.5-pro; mimo-v2.5 also supports deep thinking)' }
+        model: modelParam('pro')
       },
       output: { schema: { type: 'json' }, render: renderThink },
       async execute(args, exec) {
-        const res = await runDriver({ model: args.model || 'mimo-v2.5-pro', kind: 'think', prompt: args.prompt }, exec)
-        if (!res.ok) return { ok: false, error: res.error }
-        const d = res.data
+        const d = await runDriver({ model: resolveModel(args.model, 'pro'), kind: 'think', prompt: args.prompt }, exec)
         const msg = d.choices?.[0]?.message
         return {
-          ok: true,
           reasoning: typeof msg?.reasoning_content === 'string' && msg.reasoning_content.length > 0 ? msg.reasoning_content : null,
           answer: typeof msg?.content === 'string' && msg.content.length > 0 ? msg.content : null,
           usage: d.usage ?? null
@@ -197,30 +281,29 @@ export function apply(ctx) {
     },
     {
       name: 'mimo_json',
-      description: 'Structured JSON output from the Xiaomi MiMo model (mimo-v2.5-pro / mimo-v2.5) via response_format json_object. Describe the exact JSON structure you need (fields, types, nesting, an example) in the prompt; the model returns only valid JSON. Use when you need machine-parseable structured data, not prose.',
+      description: 'Structured JSON output from the Xiaomi MiMo model (MiMo-V2.6) via response_format json_object. Describe the exact JSON structure you need (fields, types, nesting, an example) in the prompt; the model returns only valid JSON. Use when you need machine-parseable structured data, not prose.',
       parameters: {
         prompt: { type: 'string', required: true, description: 'What to compute, plus the exact JSON structure required (fields, types, nesting; an example helps)' },
-        model: { type: 'string', description: 'Model (default mimo-v2.5-pro; mimo-v2.5 also supports structured output)' }
+        model: modelParam('pro')
       },
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
-        const res = await runDriver({ model: args.model || 'mimo-v2.5-pro', kind: 'json', prompt: args.prompt }, exec)
-        if (!res.ok) return { ok: false, error: res.error }
-        const d = res.data
+        const d = await runDriver({ model: resolveModel(args.model, 'pro'), kind: 'json', prompt: args.prompt }, exec)
         const content = d.choices?.[0]?.message?.content ?? null
         let data = null
         if (typeof content === 'string' && content.length > 0) {
           try { data = JSON.parse(content) } catch { data = content }
         }
-        return { ok: true, data, usage: d.usage ?? null }
+        return { data, usage: d.usage ?? null }
       }
     },
     {
       name: 'mimo_vision',
-      description: 'Analyze one or more images with the Xiaomi MiMo vision model (mimo-v2.5). Accepts local file paths (Windows C:\\... or WSL /mnt/...) which are base64-encoded automatically, or public image URLs. Supports JPEG/PNG/GIF/WebP/BMP.',
+      description: 'Analyze one or more images with the Xiaomi MiMo full-modal model (MiMo-V2.6, default flash). Accepts local file paths (Windows C:\\... or WSL /mnt/...) which are base64-encoded automatically, or public image URLs. Supports JPEG/PNG/GIF/WebP/BMP.',
       parameters: {
         images: { type: 'array', required: true, items: { type: 'string' }, description: 'Local file paths or public URLs of images to analyze' },
-        prompt: { type: 'string', required: true, description: 'What to ask about the image(s)' }
+        prompt: { type: 'string', required: true, description: 'What to ask about the image(s)' },
+        model: modelParam('flash')
       },
       output: { schema: { type: 'json' }, render: renderText },
       async execute(args, exec) {
@@ -230,83 +313,77 @@ export function apply(ctx) {
           if (/^https?:\/\//.test(img) || /^data:/.test(img)) urls.push(img)
           else locals.push({ kind: 'image', mime: mimeOf(img), path: wslPathOf(img) })
         }
-        const res = await runDriver({ model: 'mimo-v2.5', kind: 'vision', files: locals, urls, prompt: args.prompt }, exec)
-        if (!res.ok) return { ok: false, error: res.error }
-        const d = res.data
-        return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
+        const d = await runDriver({ model: resolveModel(args.model, 'flash'), kind: 'vision', files: locals, urls, prompt: args.prompt }, exec)
+        return { answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
     {
       name: 'mimo_audio',
-      description: 'Analyze audio content with the Xiaomi MiMo model (mimo-v2.5). Accepts a local file path (Windows or WSL path; auto base64) or a public URL. Supports wav/mp3/flac/ogg/m4a.',
+      description: 'Analyze audio content with the Xiaomi MiMo full-modal model (MiMo-V2.6, default flash). Accepts a local file path (Windows or WSL path; auto base64) or a public URL. Supports wav/mp3/flac/ogg/m4a.',
       parameters: {
         audio: { type: 'string', required: true, description: 'Local audio file path or public URL' },
-        prompt: { type: 'string', description: 'What to do with the audio (default: transcribe)' }
+        prompt: { type: 'string', description: 'What to do with the audio (default: transcribe)' },
+        model: modelParam('flash')
       },
       output: { schema: { type: 'json' }, render: renderText },
       async execute(args, exec) {
         const isUrl = /^https?:\/\//.test(args.audio) || /^data:/.test(args.audio)
-        const res = await runDriver({
-          model: 'mimo-v2.5', kind: 'audio',
+        const d = await runDriver({
+          model: resolveModel(args.model, 'flash'), kind: 'audio',
           files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: wslPathOf(args.audio) }],
           urls: isUrl ? [args.audio] : [],
           prompt: args.prompt || 'Please transcribe the audio content.'
         }, exec)
-        if (!res.ok) return { ok: false, error: res.error }
-        const d = res.data
-        return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
+        return { answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
     {
       name: 'mimo_video',
-      description: 'Analyze video content with the Xiaomi MiMo model (mimo-v2.5). Accepts a local video file path (Windows or WSL path; auto base64) or a public URL. Supports mp4/webm/mov.',
+      description: 'Analyze video content with the Xiaomi MiMo full-modal model (MiMo-V2.6, default flash). Accepts a local video file path (Windows or WSL path; auto base64) or a public URL. Supports mp4/webm/mov.',
       parameters: {
         url: { type: 'string', required: true, description: 'Local video file path or public URL (mp4/webm/mov)' },
         prompt: { type: 'string', description: 'What to ask about the video (default: describe)' },
-        fps: { type: 'integer', description: 'Frame sampling rate for analysis (e.g. 1, 2). Lower = cheaper/faster, higher = more detail. Optional.' },
-        media_resolution: { type: 'string', description: 'Resolution sent to the model (e.g. "default", "480p", "720p"). Optional.' }
+        fps: { type: 'number', description: 'Frames sampled per second for analysis, 0.1-10.0 (API default 2). Lower = cheaper/faster, higher = more detail.' },
+        media_resolution: { type: 'string', enum: ['default', 'max'], description: 'Resolution level sent to the model: "default" or "max" (API default "default").' },
+        model: modelParam('flash')
       },
       output: { schema: { type: 'json' }, render: renderText },
       async execute(args, exec) {
         const isUrl = /^https?:\/\//.test(args.url) || /^data:/.test(args.url)
-        const res = await runDriver({
-          model: 'mimo-v2.5', kind: 'video',
+        const d = await runDriver({
+          model: resolveModel(args.model, 'flash'), kind: 'video',
           files: isUrl ? [] : [{ kind: 'video', mime: mimeOf(args.url), path: wslPathOf(args.url) }],
           urls: isUrl ? [args.url] : [],
           prompt: args.prompt || 'Please describe the video content.',
           fps: args.fps,
           media_resolution: args.media_resolution
         }, exec)
-        if (!res.ok) return { ok: false, error: res.error }
-        const d = res.data
-        return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
+        return { answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
     {
       name: 'mimo_asr',
-      description: 'Speech-to-text with the Xiaomi MiMo ASR model (mimo-v2.5-asr). Accepts a local audio file path (Windows or WSL path; auto base64) or public URL. Supports wav/mp3.',
+      description: 'Speech-to-text with the Xiaomi MiMo ASR model (mimo-v2.5-asr — Xiaomi ships no v2.6 voice models). Accepts a local audio file path (Windows or WSL path; auto base64) or public URL. Supports wav/mp3.',
       parameters: {
         audio: { type: 'string', required: true, description: 'Local audio file path or public URL' },
-        language: { type: 'string', description: 'Optional language code, e.g. zh, en' }
+        language: { type: 'string', description: 'Optional language hint: auto (default), zh or en' }
       },
       output: { schema: { type: 'json' }, render: renderText },
       async execute(args, exec) {
         const isUrl = /^https?:\/\//.test(args.audio) || /^data:/.test(args.audio)
-        const res = await runDriver({
+        const d = await runDriver({
           model: 'mimo-v2.5-asr', kind: 'asr',
           files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: wslPathOf(args.audio) }],
           urls: isUrl ? [args.audio] : [],
           prompt: '',
           language: args.language
         }, exec)
-        if (!res.ok) return { ok: false, error: res.error }
-        const d = res.data
-        return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
+        return { answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
     {
       name: 'mimo_tts',
-      description: 'Text-to-speech with the Xiaomi MiMo TTS models. Writes the synthesized audio to a Windows-side file (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav). Voice: preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (voicedesign).',
+      description: 'Text-to-speech with the Xiaomi MiMo TTS models (mimo-v2.5-tts / -voicedesign — Xiaomi ships no v2.6 voice models). Writes the synthesized audio to a Windows-side file (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav). Voice: preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (voicedesign).',
       parameters: {
         text: { type: 'string', required: true, description: 'Text to synthesize' },
         voice: { type: 'string', description: 'Preset voice ID or custom voice description (default mimo_default)' },
@@ -334,6 +411,7 @@ export function apply(ctx) {
         const messages = []
         messages.push({ role: 'user', content: userContent })
         messages.push({ role: 'assistant', content: text })
+        // optimize_text_preview is voicedesign-only (official TTS docs).
         const audio = isPreset
           ? { format: fmt, voice }
           : { format: fmt, optimize_text_preview: true }
@@ -357,25 +435,33 @@ export function apply(ctx) {
         const out = r.stdout.text.trim()
         if (!out.startsWith('OK')) {
           await run(`rm -f ${shq(tmp + '.json')} ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
-          return { ok: false, error: out.replace(/^(HTTP_ERR|NET_ERR):/, '') || 'TTS failed' }
+          throw new Error(out.replace(/^(HTTP_ERR|NET_ERR):/, '') || 'TTS failed')
         }
+        // Decode the base64 audio inside python (it is ~150KB+, far beyond the
+        // shell capture budget) and grab the optional final_text_preview the
+        // voicedesign model returns next to it.
         const dec = b64([
           'import json,base64,sys',
           'd=json.load(open(sys.argv[1]))',
-          'b=d["choices"][0]["message"]["audio"]["data"]',
+          'm=d["choices"][0]["message"]',
+          'b=m["audio"]["data"]',
           'open(sys.argv[2],"wb").write(base64.b64decode(b))',
+          'p=m.get("final_text_preview")',
+          'open(sys.argv[3],"w",encoding="utf-8").write(p if isinstance(p,str) else "")',
         ].join('\n'))
-        const decRun = await run(`printf '%s' ${dec} | base64 -d | python3 - ${shq(tmp + '.resp')} ${shq(outWsl)}`, exec, { timeoutMs: 30000 })
-        await run(`rm -f ${shq(tmp + '.json')} ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
-        if (decRun.exitCode !== 0) return { ok: false, error: decRun.stderr.text.trim().slice(0, 300) }
+        const decRun = await run(`printf '%s' ${dec} | base64 -d | python3 - ${shq(tmp + '.resp')} ${shq(outWsl)} ${shq(tmp + '.preview')}`, exec, { timeoutMs: 30000 })
+        let preview = ''
+        try { preview = (await run(`cat ${shq(tmp + '.preview')}`, exec, { timeoutMs: 5000 })).stdout.text.trim() } catch {}
+        await run(`rm -f ${shq(tmp + '.json')} ${shq(tmp + '.resp')} ${shq(tmp + '.preview')}`, exec, { timeoutMs: 5000 }).catch(() => {})
+        if (decRun.exitCode !== 0) throw new Error(decRun.stderr.text.trim().slice(0, 300) || 'failed to decode synthesized audio')
         let bytes = 0
         try { bytes = Number((await run(`wc -c < ${shq(outWsl)}`, exec, { timeoutMs: 5000 })).stdout.text.trim()) || 0 } catch {}
-        return { ok: true, output: outWsl, bytes }
+        return { output: outWsl, bytes, format: fmt, ...preview ? { final_text_preview: preview } : {} }
       }
     },
     {
       name: 'mimo_voiceclone',
-      description: 'Voice cloning with the Xiaomi MiMo voice-clone model (mimo-v2.5-tts-voiceclone). Given a reference audio file (wav/mp3, local path or public URL) and target text, synthesizes speech in the reference speaker\'s voice. The reference audio is sent as a data URL; keep it short (a few seconds is enough).',
+      description: 'Voice cloning with the Xiaomi MiMo voice-clone model (mimo-v2.5-tts-voiceclone — Xiaomi ships no v2.6 voice models). Given a reference audio file (wav/mp3, local path or public URL) and target text, synthesizes speech in the reference speaker\'s voice. The reference audio is sent as a data URL; keep it short (a few seconds is enough).',
       parameters: {
         text: { type: 'string', required: true, description: 'Text to synthesize in the cloned voice' },
         reference: { type: 'string', required: true, description: 'Reference audio path (local WSL/Windows path) or public URL — a short clip of the voice to clone' },
@@ -433,7 +519,7 @@ export function apply(ctx) {
           const errRun = await run(`printf '%s' ${errPy} | base64 -d | python3 - ${shq(tmp + '.resp')}`, exec, { timeoutMs: 10000 })
           const errText = (errRun.stdout.text || '').trim()
           await run(`rm -f ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
-          return { ok: false, error: errText.replace(/^(HTTP_ERR|NET_ERR):/, '') || status || 'voice clone failed' }
+          throw new Error(errText.replace(/^(HTTP_ERR|NET_ERR):/, '') || status || 'voice clone failed')
         }
         // Extract the base64 audio from the response JSON via python reading the
         // file directly — the audio data can be ~150KB, far beyond the 64KB
@@ -451,11 +537,11 @@ export function apply(ctx) {
         const extractRun = await run(`printf '%s' ${extractPy} | base64 -d | python3 - ${shq(tmp + '.resp')} ${shq(outWsl)}`, exec, { timeoutMs: 30000 })
         await run(`rm -f ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
         if (!extractRun.stdout.text.trim().startsWith('OK')) {
-          return { ok: false, error: (extractRun.stdout.text.trim().replace(/^ERR:/, '') || 'failed to decode audio') }
+          throw new Error(extractRun.stdout.text.trim().replace(/^ERR:/, '') || 'failed to decode audio')
         }
         let bytes = 0
         try { bytes = Number((await run(`wc -c < ${shq(outWsl)}`, exec, { timeoutMs: 5000 })).stdout.text.trim()) || 0 } catch {}
-        return { ok: true, output: outWsl, bytes }
+        return { output: outWsl, bytes, format: fmt }
       }
     }
   ]
@@ -473,6 +559,7 @@ export function apply(ctx) {
     name: 'audio-tools',
     description: 'MiMo audio tools: mimo_asr (transcribe), mimo_tts (speak), mimo_voiceclone (clone a voice), mimo_audio (understand audio content).',
     whenToUse: 'Use whenever a task involves audio: transcribing a recording, synthesizing speech, cloning a voice from a reference clip, or understanding the content of an audio file.',
+    source: 'runtime',
     content: [
       '# audio-tools (MiMo edition)',
       '',
@@ -480,16 +567,17 @@ export function apply(ctx) {
       '',
       '## Tools',
       '',
-      '- **mimo_asr** — transcribe an audio file (wav/mp3, local path or URL) to text with the MiMo ASR model. Optionally pass `language` (e.g. zh, en) for a hint.',
+      '- **mimo_asr** — transcribe an audio file (wav/mp3, local path or URL) to text with the MiMo ASR model (mimo-v2.5-asr). Optionally pass `language` (`auto`/`zh`/`en`) for a hint.',
       '- **mimo_tts** — synthesize text into a .wav/.mp3 file. `voice` is a preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (uses the voicedesign model). `style` adds a speaking tone; `format` picks wav (default) or mp3. Output lands on the Windows side (default C:\\Windows\\Temp).',
       '- **mimo_voiceclone** — clone a voice: give a short reference audio clip (local path or URL) plus target text; output is speech in the reference speaker\'s voice. `format` picks wav (default) or mp3.',
-      '- **mimo_audio** — understand the content of an audio file (wav/mp3/flac/ogg/m4a): summarize, extract information, or answer questions about what is said or played.',
+      '- **mimo_audio** — understand the content of an audio file (wav/mp3/flac/ogg/m4a) with the full-modal MiMo-V2.6 model (default `flash` tier): summarize, extract information, or answer questions about what is said or played.',
       '',
       '## Usage notes',
       '',
       '- Inputs accept local paths (WSL `/home/...`, `/mnt/c/...` or Windows `C:\\...`) or public URLs.',
       '- TTS and voiceclone write .wav files to `C:\\Windows\\Temp` by default (`.mp3` with `format: "mp3"`); pass `output` to choose another Windows-side path.',
       '- For voice cloning, keep the reference clip short (a few seconds); the audio is sent to the MiMo API as a data URL.',
+      '- The voice models are still the v2.5 generation (mimo-v2.5-asr / -tts / -voicedesign / -voiceclone): Xiaomi has published no v2.6 voice models.',
       '- These tools send audio to the Xiaomi MiMo API; do not use them for sensitive audio you cannot upload.',
     ].join('\n'),
   }
