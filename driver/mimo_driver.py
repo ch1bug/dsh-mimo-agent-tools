@@ -14,15 +14,16 @@ Usage:
 
 Spec JSON shape:
 {
-  "model": "mimo-v2.5" | "mimo-v2.5-asr" | "mimo-v2.5-pro" | ...,
+  "model": "mimo-v2.6-pro" | "mimo-v2.6-flash" | "mimo-v2.6-pro-ultraspeed"
+          | "mimo-v2.5-asr" | ...,
   "key": "api key",
   "url": "https://api.xiaomimimo.com/v1/chat/completions",
   "timeout": 90,
   "prompt": "user text prompt",
   "kind": "vision" | "audio" | "asr" | "video" | "chat" | "think" | "json",
-  "language": "zh" | undefined,      // asr only
-  "fps": 2 | undefined,              // video only (frame sampling rate)
-  "media_resolution": "default" | undefined,  // video only
+  "language": "auto" | "zh" | "en" | undefined,  // asr only
+  "fps": 2 | undefined,              // video only (frames sampled per second, 0.1-10.0)
+  "media_resolution": "default" | "max" | undefined,  // video only
   "files": [ {"kind": "image"|"audio"|"video", "mime": "...", "path": "/abs/path"} ],
   "urls": ["https://..."]            // vision: image URLs; audio/asr: audio URL;
                                      // video: video URL (per official docs the
@@ -40,11 +41,12 @@ import urllib.error
 def _video_item(url, spec):
     """One content item for a video: video_url plus optional fps / media_resolution
     (both are SIBLING fields of video_url in the content item, per the official
-    video-understanding docs)."""
+    video-understanding docs: fps is a float in [0.1, 10.0] defaulting to 2,
+    media_resolution is "default" | "max")."""
     item = {"type": "video_url", "video_url": {"url": url}}
     fps = spec.get("fps")
     if fps is not None:
-        item["fps"] = int(fps)
+        item["fps"] = float(fps)
     res = spec.get("media_resolution")
     if res:
         item["media_resolution"] = str(res)
@@ -120,6 +122,7 @@ def build_body(spec):
         body = {"model": model, "messages": [{"role": "user", "content": parts}], "stream": False}
         lang = spec.get("language")
         if lang:
+            # Official ASR docs: asr_options.language is "auto" | "zh" | "en".
             body["asr_options"] = {"language": lang}
         return body
     if not prompt and kind == "chat":
@@ -129,20 +132,25 @@ def build_body(spec):
         "model": model,
         "messages": [{"role": "user", "content": parts}],
         "stream": False,
-        "max_completion_tokens": 2048,
+        "max_completion_tokens": 4096,
+        # Thinking is ENABLED by default on MiMo-V2.6 — disable it explicitly
+        # everywhere a plain answer is wanted (the budget counts reasoning
+        # tokens against max_completion_tokens).
         "thinking": {"type": "disabled"},
     }
     if kind == "think":
         # Deep thinking (official deep-thinking docs): thinking enabled →
-        # the response carries reasoning_content alongside content. Deeper
-        # problems deserve a larger completion budget.
+        # the response carries reasoning_content alongside content.
+        # max_completion_tokens covers reasoning tokens too, so a deep problem
+        # deserves a large budget (API range is [1, 131072]).
         body["thinking"] = {"type": "enabled"}
-        body["max_completion_tokens"] = 4096
+        body["max_completion_tokens"] = 16384
     elif kind == "json":
         # Structured output (official structured-output docs): response_format
-        # json_object + an explicit instruction to return JSON only.
+        # json_object + an explicit instruction to return JSON only. No
+        # json_schema variant exists — structure lives in the prompt.
         body["response_format"] = {"type": "json_object"}
-        body["max_completion_tokens"] = 4096
+        body["max_completion_tokens"] = 8192
         body["messages"] = [
             {"role": "system", "content": "You must return only valid JSON matching the requested structure. No markdown fences, no commentary, no trailing text."},
             {"role": "user", "content": parts},
